@@ -10,9 +10,10 @@
 //
 // So this suite runs the real screen against a minimal DOM: enough of an element,
 // document and media element for the overlay to mount, pick a clip, start it, and
-// answer a pointer press. Timers are captured and never fired, which is what makes
-// it deterministic — every assertion below is about state the screen reaches
-// synchronously or in a microtask, and none of it depends on wall time.
+// answer a pointer press. Timers are captured rather than scheduled, so the wall
+// clock never decides an assertion: all of it is about state the screen reaches
+// synchronously or in a microtask, except section [8], which fires the two sound
+// windows by hand to pin down what a cold start does when play() is slow.
 //
 // Run from the package root:  node verify/verify-options.mjs
 
@@ -146,9 +147,23 @@ class Element {
     // note on the button.
     const { policy, gesture } = this.activation
     const refused = this.muted === false
-      && (policy === 'refuse-always' || (policy === 'refuse-unmuted' && !gesture))
+      && (policy === 'refuse-always'
+        || (policy === 'refuse-unmuted' && !gesture)
+        // 'cold-unmuted' is the audio device that is not up yet after a boot: the
+        // unmuted call is refused until the test says the device answers.
+        || (policy === 'cold-unmuted' && this.activation.cold === true))
     if (refused) {
       return Promise.reject(Object.assign(new Error('play() failed'), { name: 'NotAllowedError' }))
+    }
+    // 'slow-unmuted' and 'stuck-unmuted' are the cold start after a boot: the
+    // unmuted call is neither refused nor answered for a while, because the audio
+    // pipeline is still coming up. 'slow-unmuted' answers when the test warms it;
+    // 'stuck-unmuted' never answers at all.
+    if (this.muted === false && (policy === 'slow-unmuted' || policy === 'stuck-unmuted')) {
+      if (policy === 'stuck-unmuted') return new Promise(() => {})
+      return new Promise((resolve) => {
+        this.warm = () => { this.paused = false; resolve() }
+      })
     }
     this.paused = false
     return Promise.resolve()
@@ -160,7 +175,7 @@ class Element {
 function makeDocument(playPolicy) {
   // One activation record per document: the gesture the page has seen belongs to
   // the page, not to the element that happened to be pressed.
-  const activation = { policy: playPolicy ?? 'allow', gesture: false }
+  const activation = { policy: playPolicy ?? 'allow', gesture: false, cold: playPolicy === 'cold-unmuted' }
   const make = (tag) => {
     const element = new Element(tag)
     element.activation = activation
@@ -222,6 +237,20 @@ const video = (bundle) => find(bundle.doc.body, 'video')
 const overlay = (bundle) => bundle.sandbox.__DSH_BOOT_ANIM__
 const state = (bundle) => overlay(bundle).el.getAttribute('data-state')
 const press = (bundle) => video(bundle).parentNode.dispatch('pointerdown', { target: overlay(bundle).el })
+/** Fire the captured timers with one delay — section [8] fires the sound windows. */
+const fire = (bundle, ms) => { for (const timer of bundle.timers.filter((t) => t.ms === ms)) timer.handler() }
+/** Answer the slow unmuted play(), as a warmed-up audio pipeline eventually does. */
+const warm = (bundle) => { const begin = video(bundle).warm; if (begin !== undefined) begin() }
+/** Let the audio device come up, as it does a moment after a boot. */
+const warmDevice = (bundle) => { video(bundle).activation.cold = false }
+/** The audio outcome the screen wrote onto its root, for the diagnostics line. */
+const soundAttr = (bundle) => {
+  const nodes = []
+  const walk = (node) => { nodes.push(node); for (const child of node.children ?? []) walk(child) }
+  walk(overlay(bundle).el)
+  const hit = nodes.find((node) => node.getAttribute('data-sound') !== undefined && node.getAttribute('data-sound') !== null)
+  return hit === undefined ? null : hit.getAttribute('data-sound')
+}
 
 // ---------------------------------------------------------------------------
 console.log('\n[1] defaults: sound on, two-step press, hint shown')
@@ -518,6 +547,71 @@ legacy.refresh()
 const legacyInputs = legacy.nodes.filter((node) => node.type === 'input')
 equal('an old settings document renders the three switches at their defaults',
   legacyInputs.slice(1).map((node) => node.props.checked), [true, false, true])
+
+// ---------------------------------------------------------------------------
+console.log('\n[8] a cold start whose unmuted play() is slow keeps its sound')
+// ---------------------------------------------------------------------------
+// The audio pipeline is cold for the first playback after a boot, so the unmuted
+// play() can take seconds to answer. Muting the element at the first window — what
+// the single 1.2s bound used to do — is what silenced every cold start while every
+// warm one kept its sound.
+const slow = mount({ sound: true, clickToEnter: false, showHint: true }, { playPolicy: 'slow-unmuted' })
+await settle()
+equal('the unmuted attempt is the only one in flight', video(slow).playCalls, [false])
+check('the element is still unmuted while that attempt is pending', video(slow).muted === false,
+  'muted=' + String(video(slow).muted))
+fire(slow, 1200)
+equal('the first window arms the retry without spending another play()', video(slow).playCalls, [false])
+check('...and does not mute the element, so the pending attempt still has sound to start with',
+  video(slow).muted === false, 'muted=' + String(video(slow).muted))
+equal('...and records the refusal so the button can offer the press-to-retry',
+  overlay(slow).audioBlocked, 'refused')
+warm(slow)
+await settle()
+equal('the pending attempt then resolves as the audible start', video(slow).playCalls, [false])
+check('sound is not reported as blocked any more', overlay(slow).audioBlocked === null,
+  'audioBlocked=' + String(overlay(slow).audioBlocked))
+check('the outcome and how long it took are written for the diagnostics line',
+  /^on:\d+$/.test(soundAttr(slow)), String(soundAttr(slow)))
+
+// The longer bound is a backstop, not the primary path: a start that never answers
+// must still be watched, so the clip is muted at that point rather than skipped.
+const stuck = mount({ sound: true }, { playPolicy: 'stuck-unmuted' })
+await settle()
+equal('a start that never answers is left unmuted', video(stuck).playCalls, [false])
+fire(stuck, 1200)
+equal('the first window does not mute it either', video(stuck).playCalls, [false])
+check('...and the element is still unmuted', video(stuck).muted === false,
+  'muted=' + String(video(stuck).muted))
+fire(stuck, 5000)
+equal('only the long bound mutes the element and starts the clip', video(stuck).playCalls, [false, true])
+check('...and the diagnostics line says the sound was given up on',
+  /^muted:\d+$/.test(soundAttr(stuck)), String(soundAttr(stuck)))
+
+// ---------------------------------------------------------------------------
+console.log('\n[9] a cold start whose unmuted play() is refused takes the sound back')
+// ---------------------------------------------------------------------------
+// The other shape of a cold start: the audio device is not up yet, so the unmuted
+// call is refused before the policy could even be consulted. A muted clip has to
+// start anyway, and the sound has to be taken back once the device answers.
+const cold = mount({ sound: true, clickToEnter: false, showHint: true }, { playPolicy: 'cold-unmuted' })
+await settle()
+equal('the refused unmuted start falls back to a muted clip', video(cold).playCalls, [false, true])
+check('...and the element is muted', video(cold).muted === true, 'muted=' + String(video(cold).muted))
+equal('...with the refusal recorded for the button', overlay(cold).audioBlocked, 'refused')
+check('...and the diagnostics line says the sound was given up on',
+  /^muted:\d+$/.test(soundAttr(cold)), String(soundAttr(cold)))
+check('a retry for the sound is armed behind the running clip',
+  cold.timers.some((timer) => timer.ms === 1500), 'delays=' + JSON.stringify(cold.timers.map((timer) => timer.ms)))
+warmDevice(cold)
+fire(cold, 1500)
+await settle()
+equal('the retry unmutes the running clip instead of restarting it', video(cold).playCalls, [false, true, false])
+check('...and the element is audible', video(cold).muted === false, 'muted=' + String(video(cold).muted))
+check('...with the block cleared so the button promises the sound', overlay(cold).audioBlocked === null,
+  'audioBlocked=' + String(overlay(cold).audioBlocked))
+check('...and the late arrival is what the diagnostics line records',
+  /^late:\d+$/.test(soundAttr(cold)), String(soundAttr(cold)))
 
 // A bundle that is not the current build of the source is the one artifact
 // failure this package cannot detect at runtime: the shell serves lib/, the

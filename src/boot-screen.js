@@ -57,6 +57,19 @@
   var SOUND_HINT_OFF = '点一下打开声音'
   var SOUND_HINT_ON = '点一下关闭声音'
   var SOUND_HINT_REFUSED = '浏览器拒绝了声音，点一下重试'
+  // How long the unmuted start may stay unresolved before the retry is armed, and
+  // how long before the clip is muted so that it is watched instead of skipped. The
+  // second bound stays inside the six-second no-frame watchdog on purpose: after a
+  // boot the audio pipeline can take seconds to come up, and muting at the first
+  // mark is what silenced every cold start while every warm one kept its sound.
+  var SOUND_ARM_MS = 1200
+  var SOUND_MUTE_MS = 5000
+  // How long after a muted start the screen asks for the sound again, and how many
+  // times. A cold boot can also refuse the unmuted start outright while the audio
+  // device is still coming up, and that refusal is not about the policy at all: the
+  // device answers a moment later, so asking again is worth it.
+  var SOUND_LATE_MS = 1500
+  var SOUND_LATE_TRIES = 3
   // A press enters instead of unlocking audio. See press().
   var CLICK_TO_ENTER = cfg.clickToEnter === true
   // The bottom hint line. Off hides that one element; the title and the progress
@@ -1079,11 +1092,21 @@
          * @param onBlocked - called when neither unmuted nor muted playback starts.
          */
         function startClip(video, onPlaying, onBlocked) {
+          // How long this start took and which way it went, written on the overlay
+          // root. Whether the audio pipeline was slow to come up is the one thing a
+          // screenshot of this screen cannot show, and it is what decides between a
+          // silent cold start and an audible one.
+          var soundStartedAt = Date.now()
+          var noteAudio = function (outcome) {
+            try {
+              parts.root.setAttribute('data-sound', outcome + ':' + String(Date.now() - soundStartedAt))
+            } catch (error) {}
+          }
           var decided = false
           var settle = function (fn) { return function () { if (decided) return; decided = true; fn() } }
           var playing = settle(onPlaying)
           var blocked = settle(onBlocked)
-          var attemptPlay = function (muted, onRefused) {
+          var attemptPlay = function (muted, onRefused, onStarted) {
             video.muted = muted
             var played
             try {
@@ -1097,6 +1120,7 @@
             // fallback stays silent however it ended, so the reason — and the label
             // drawn from it — are left exactly as they were.
             var started = function () {
+              if (onStarted !== undefined) onStarted()
               if (muted) renderSound()
               else setAudioBlocked(null)
               playing()
@@ -1107,7 +1131,9 @@
             }
             started()
           }
-          var fallback = function () {
+          // The sound is not there yet: say so and arm the press-to-retry, but
+          // leave the element alone — the unmuted attempt may still be on its way.
+          var armRetry = function () {
             setAudioBlocked('refused')
             audioRetry = function () {
               attemptPlay(false, function () {
@@ -1118,7 +1144,29 @@
                 setAudioBlocked('refused', SOUND_HINT_REFUSED)
               })
             }
+          }
+          // Asking for the sound again behind a clip that is already running muted, a
+          // bounded number of times. The unmuted start can be refused outright while
+          // the audio device is still coming up after a boot, and that refusal says
+          // nothing about the policy or about the next attempt: once the clip runs,
+          // unmuting it costs nothing and the sound joins mid-clip.
+          var lateWindow = 0
+          var lateTries = 0
+          var askSound = function (delay) {
+            if (!SOUND_ON || lateTries >= SOUND_LATE_TRIES || video.paused === true) return
+            lateTries++
+            lateWindow = globalThis.setTimeout(function () {
+              attemptPlay(false, function () { askSound(SOUND_LATE_MS) }, function () { noteAudio('late') })
+            }, delay)
+          }
+          // The unmuted start is not coming: mute the element and start it, so the
+          // clip is watched silently rather than skipped by the no-frame watchdog,
+          // and keep asking for the sound behind it.
+          var fallback = function () {
+            noteAudio('muted')
+            armRetry()
             attemptPlay(true, blocked)
+            askSound(SOUND_LATE_MS)
           }
           // Sound is off for good: skip the unmuted attempt and the retry entirely
           // rather than try them and have them refused. Muted autoplay is also the
@@ -1132,14 +1180,40 @@
           }
           // The unmuted attempt may neither resolve nor reject on a slow or
           // conflicting load, and waiting on it forever is what leaves the screen
-          // on a bare gradient. A short window bounds it; the muted retry always
-          // starts because muted autoplay is what the policy permits.
-          var soundWindow = globalThis.setTimeout(fallback, 1200)
-          var settleWindow = function () { globalThis.clearTimeout(soundWindow) }
+          // on a bare gradient. Bounding it is right; muting it at that bound is
+          // not — the audio pipeline is cold for the first playback after a boot,
+          // so a single short window muted clips whose unmuted start was merely
+          // slow and every cold start came out silent while every warm one kept its
+          // sound. The short window now only says the sound is not there yet and
+          // arms the retry; the element is muted when the unmuted promise refuses,
+          // or at the longer bound for a start that never settles at all.
+          var soundWindow = globalThis.setTimeout(armRetry, SOUND_ARM_MS)
+          var muteWindow = globalThis.setTimeout(fallback, SOUND_MUTE_MS)
+          var settleWindow = function () {
+            globalThis.clearTimeout(soundWindow)
+            globalThis.clearTimeout(muteWindow)
+          }
           // This attempt resolved unmuted: the clip is audible, and this is the one
           // fact the button is drawn from, so it is written before the reveal
-          // callback gets to say anything about the clip.
-          var unmutedPlaying = function () { settleWindow(); setAudioBlocked(null); playing() }
+          // callback gets to say anything about the clip. A start that resolves only
+          // after the muted fallback took over must not claim sound it does not
+          // have, so the element is asked rather than assumed.
+          var unmutedPlaying = function () {
+            settleWindow()
+            if (video.muted) {
+              // The muted fallback took over while this attempt was still in flight,
+              // and it has just resolved, which is the pipeline saying it is up. The
+              // clip is running silently, so take the sound back now — and leave the
+              // bounded retries in place in case this attempt is refused as well.
+              if (lateWindow !== 0) globalThis.clearTimeout(lateWindow)
+              askSound(0)
+              playing()
+              return
+            }
+            noteAudio('on')
+            setAudioBlocked(null)
+            playing()
+          }
           var unmutedRefused = function () { settleWindow(); fallback() }
           video.muted = false
           var played
